@@ -250,14 +250,7 @@ let playing = false;
 let speed = 5;
 let timer = null;
 let currentTradeIdx = -1;
-
-// Build trade lookup by bar timestamp
-const tradeEntryMap = {{}};
-const tradeExitMap = {{}};
-allTrades.forEach((t, i) => {{
-    tradeEntryMap[t.entry_time.replace(' ','T')] = i;
-    tradeExitMap[t.exit_time.replace(' ','T')] = i;
-}});
+let allMarkers = [];  // accumulates markers during replay
 
 function addBar(idx) {{
     if (idx >= allCandles.length) return;
@@ -271,39 +264,33 @@ function addBar(idx) {{
         eqLine.update({{ time: t, value: allEquity[idx].eq }});
     }}
 
-    // Check for trade markers
-    const markers = [];
-    const ts = new Date(t * 1000).toISOString().slice(0,19);
-
+    // Check for trade entries/exits at this candle time
     allTrades.forEach(tr => {{
-        const entryTs = Math.floor(new Date(tr.entry_time + 'Z').getTime() / 1000);
-        const exitTs = Math.floor(new Date(tr.exit_time + 'Z').getTime() / 1000);
-
-        if (entryTs === t) {{
-            markers.push({{
+        if (tr.entry_ct === t) {{
+            allMarkers.push({{
                 time: t,
                 position: tr.side === 'long' ? 'belowBar' : 'aboveBar',
                 color: tr.pnl > 0 ? '#00d4aa' : '#ff4757',
                 shape: tr.side === 'long' ? 'arrowUp' : 'arrowDown',
-                text: (tr.side === 'long' ? '▲' : '▼') + ' $' + tr.pnl.toFixed(2),
+                text: (tr.side === 'long' ? '▲ LONG' : '▼ SHORT') + ' $' + tr.pnl.toFixed(2),
             }});
             showTradeInfo(tr, 'ENTRY');
         }}
-        if (exitTs === t) {{
-            markers.push({{
+        if (tr.exit_ct === t) {{
+            allMarkers.push({{
                 time: t,
                 position: 'inBar',
                 color: tr.pnl > 0 ? '#00d4aa' : '#ff4757',
                 shape: 'circle',
-                text: '✕ ' + tr.reason,
+                text: '✕ ' + tr.reason + ' $' + tr.pnl.toFixed(2),
             }});
+            showTradeInfo(tr, 'EXIT');
         }}
     }});
 
-    if (markers.length > 0) {{
-        const existing = candleSeries.markers() || [];
-        candleSeries.setMarkers([...existing, ...markers]);
-    }}
+    // Sort markers by time (required by lightweight-charts)
+    allMarkers.sort((a, b) => a.time - b.time);
+    candleSeries.setMarkers(allMarkers);
 
     document.getElementById('progress').textContent =
         (idx+1) + '/' + allCandles.length + ' bars';
@@ -323,8 +310,12 @@ function showTradeInfo(t, label) {{
 function togglePlay() {{
     playing = !playing;
     document.getElementById('playBtn').textContent = playing ? '⏸ Pause' : '▶ Play';
-    if (playing) startReplay();
-    else clearInterval(timer);
+    if (playing) {{
+        if (currentIdx === 0) allMarkers = [];  // reset markers on fresh start
+        startReplay();
+    }} else {{
+        clearInterval(timer);
+    }}
 }}
 
 function startReplay() {{
@@ -349,31 +340,40 @@ function skipToTrade(dir) {{
     if (currentTradeIdx >= allTrades.length) currentTradeIdx = allTrades.length - 1;
 
     const t = allTrades[currentTradeIdx];
-    const entryTs = Math.floor(new Date(t.entry_time + 'Z').getTime() / 1000);
 
-    // Find bar index for this timestamp
+    // Find bar index for this trade's entry candle time
     for (let i = 0; i < allCandles.length; i++) {{
-        if (allCandles[i].time >= entryTs) {{
-            // Show all bars up to this point
-            const barsToShow = allCandles.slice(0, i + 20);
+        if (allCandles[i].time >= t.entry_ct) {{
+            const endIdx = Math.min(i + 30, allCandles.length);
+            const barsToShow = allCandles.slice(0, endIdx);
             candleSeries.setData(barsToShow.map(c => ({{ time:c.time, open:c.open, high:c.high, low:c.low, close:c.close }})));
-            currentIdx = i + 20;
+            volumeSeries.setData(barsToShow.map(c => ({{ time:c.time, value:c.volume, color: c.close>=c.open ? 'rgba(0,212,170,0.2)' : 'rgba(255,71,87,0.2)' }})));
+            currentIdx = endIdx;
 
             // Set markers for all trades up to this point
-            const markers = [];
+            allMarkers = [];
             allTrades.forEach(tr => {{
-                const ets = Math.floor(new Date(tr.entry_time + 'Z').getTime() / 1000);
-                if (ets <= allCandles[currentIdx-1].time) {{
-                    markers.push({{
-                        time: ets,
+                if (tr.entry_ct <= allCandles[currentIdx-1].time) {{
+                    allMarkers.push({{
+                        time: tr.entry_ct,
                         position: tr.side === 'long' ? 'belowBar' : 'aboveBar',
                         color: tr.pnl > 0 ? '#00d4aa' : '#ff4757',
                         shape: tr.side === 'long' ? 'arrowUp' : 'arrowDown',
-                        text: (tr.side==='long'?'▲':'▼') + ' $' + tr.pnl.toFixed(2),
+                        text: (tr.side==='long'?'▲ LONG':'▼ SHORT') + ' $' + tr.pnl.toFixed(2),
+                    }});
+                }}
+                if (tr.exit_ct <= allCandles[currentIdx-1].time) {{
+                    allMarkers.push({{
+                        time: tr.exit_ct,
+                        position: 'inBar',
+                        color: tr.pnl > 0 ? '#00d4aa' : '#ff4757',
+                        shape: 'circle',
+                        text: '✕ ' + tr.reason,
                     }});
                 }}
             }});
-            candleSeries.setMarkers(markers);
+            allMarkers.sort((a,b) => a.time - b.time);
+            candleSeries.setMarkers(allMarkers);
             showTradeInfo(t, 'TRADE #' + (currentTradeIdx+1));
             chart.timeScale().scrollToPosition(-5, false);
             break;
@@ -391,19 +391,26 @@ function showAll() {{
     eqLine.setData(allEquity.map(e => ({{ time: e.time, value: e.eq }})));
     currentIdx = allCandles.length;
 
-    // All trade markers
-    const markers = [];
+    // All trade markers using pre-snapped candle times
+    allMarkers = [];
     allTrades.forEach(t => {{
-        const ets = Math.floor(new Date(t.entry_time + 'Z').getTime() / 1000);
-        markers.push({{
-            time: ets,
+        allMarkers.push({{
+            time: t.entry_ct,
             position: t.side === 'long' ? 'belowBar' : 'aboveBar',
             color: t.pnl > 0 ? '#00d4aa' : '#ff4757',
             shape: t.side === 'long' ? 'arrowUp' : 'arrowDown',
-            text: (t.side==='long'?'▲':'▼') + ' $' + t.pnl.toFixed(2) + ' (' + t.reason + ')',
+            text: (t.side==='long'?'▲ LONG':'▼ SHORT') + ' $' + t.pnl.toFixed(2) + ' (' + t.reason + ')',
+        }});
+        allMarkers.push({{
+            time: t.exit_ct,
+            position: 'inBar',
+            color: t.pnl > 0 ? '#00d4aa' : '#ff4757',
+            shape: 'circle',
+            text: '✕ ' + t.reason + ' $' + t.pnl.toFixed(2),
         }});
     }});
-    candleSeries.setMarkers(markers);
+    allMarkers.sort((a,b) => a.time - b.time);
+    candleSeries.setMarkers(allMarkers);
     chart.timeScale().fitContent();
 
     document.getElementById('progress').textContent = allCandles.length + '/' + allCandles.length + ' bars';
@@ -456,6 +463,27 @@ def main():
             "close": round(float(row["close"]), 6),
             "volume": round(float(row["volume"]), 2),
         })
+
+    # Build a set of candle timestamps for snapping
+    candle_times = [c["time"] for c in candles]
+
+    def snap_to_candle(ts_str):
+        """Find the nearest candle timestamp to a trade timestamp."""
+        t = pd.Timestamp(ts_str)
+        if t.tzinfo:
+            t = t.tz_localize(None)
+        ts_unix = int(t.timestamp())
+        # Find closest candle time
+        best = candle_times[0]
+        for ct in candle_times:
+            if abs(ct - ts_unix) < abs(best - ts_unix):
+                best = ct
+        return best
+
+    # Snap trade timestamps to candle timestamps
+    for t in trades:
+        t["entry_ct"] = snap_to_candle(t["entry_time"])
+        t["exit_ct"] = snap_to_candle(t["exit_time"])
 
     # Equity with matching timestamps
     eq_json = []
