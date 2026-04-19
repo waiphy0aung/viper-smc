@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import config
 from data import MultiTFData
 from mtf import analyze, SignalDirection
-from signal import generate_signal
+from signals import generate_signal
 from notifier import send_signal, send_startup, send_warning
 
 

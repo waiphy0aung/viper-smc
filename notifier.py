@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import requests
 
 import config
-from signal import TradeSignal
+from signals import TradeSignal
 
 logger = logging.getLogger(__name__)
 

@@ -1,13 +1,12 @@
 """
-Multi-Timeframe Analyzer — top-down institutional analysis.
+Multi-Timeframe Analyzer v2 — deep SMC with all filters.
 
-Weekly  → Draw on liquidity (PWH/PWL), weekly structure
-Daily   → Daily bias, PDH/PDL, daily OBs
-4H      → Current structure, key OBs and FVGs
-1H      → Refined entry zones, confirms 4H
-15m     → Execution trigger: sweep + CHoCH = signal
-
-Each timeframe narrows the analysis. Only trade when all align.
+New in v2:
+- Premium/Discount zones — only long in discount, short in premium
+- Displacement required — must see institutional momentum
+- Tighter killzones
+- Smarter TP: skip partial if PDH/PDL too close, use next liquidity instead
+- Entry at FVG inside OB (sniper entry) for tightest SL
 """
 
 from __future__ import annotations
@@ -18,9 +17,10 @@ from enum import Enum
 
 import pandas as pd
 
+import config
 from structure import (
-    StructureBias, StructureState, StructureBreak, BreakType,
-    SwingPoint, detect_structure, get_recent_structure,
+    StructureBias, StructureState, BreakType, PriceZone,
+    detect_structure, get_recent_structure, detect_displacement,
 )
 from liquidity import (
     LiquidityPool, LiquidityType, SweepStatus, SessionLevels,
@@ -44,48 +44,51 @@ class SignalDirection(Enum):
 
 @dataclass
 class MTFAnalysis:
-    """Complete top-down analysis result."""
     # Weekly
     weekly_bias: StructureBias
-    weekly_draw_up: float | None      # PWH or weekly BSL
-    weekly_draw_down: float | None    # PWL or weekly SSL
+    weekly_draw_up: float | None
+    weekly_draw_down: float | None
 
     # Daily
     daily_bias: StructureBias
     pdh: float
     pdl: float
-    daily_ob: Zone | None
 
     # 4H
     h4_bias: StructureBias
-    h4_structure: StructureState
     h4_ob: Zone | None
     h4_fvg: Zone | None
+    h4_dealing_range_mid: float | None
+    h4_price_zone: PriceZone | None
 
     # 1H
     h1_entry_zone: Zone | None
-    h1_fvgs: list[Zone]
 
-    # 15m execution
-    m15_choch: StructureBreak | None  # recent CHoCH on 15m
-    m15_sweep: bool                    # liquidity swept on 15m
-    m15_structure: StructureState
+    # 15m
+    m15_choch: bool
+    m15_choch_dir: str | None
+    m15_sweep: bool
+    m15_displacement: bool
+    m15_disp_dir: str | None
 
     # Derived
     direction: SignalDirection
-    confidence: float                  # 0-1 based on alignment
-    entry_zone_price: float | None
+    confidence: float
+    entry_price: float | None
     sl_price: float | None
-    tp1_price: float | None           # partial TP (PDH/PDL)
-    tp2_price: float | None           # full TP (draw on liquidity)
+    tp1_price: float | None
+    tp2_price: float | None
+    tp1_rr: float
+    tp2_rr: float | None
+    use_partial: bool           # whether to use partial TP at tp1
+    reason: str
 
     def __repr__(self):
         return (
-            f"MTF({self.direction.value} | "
-            f"W={self.weekly_bias.value} D={self.daily_bias.value} "
-            f"4H={self.h4_bias.value} | conf={self.confidence:.1f} | "
-            f"entry={self.entry_zone_price} SL={self.sl_price} "
-            f"TP1={self.tp1_price} TP2={self.tp2_price})"
+            f"MTF({self.direction.value} conf={self.confidence:.0%} "
+            f"zone={self.h4_price_zone.value if self.h4_price_zone else '?'} "
+            f"disp={'Y' if self.m15_displacement else 'N'} "
+            f"sweep={'Y' if self.m15_sweep else 'N'})"
         )
 
 
@@ -96,204 +99,323 @@ def analyze(
     df_1h: pd.DataFrame,
     df_15m: pd.DataFrame,
     current_price: float,
+    symbol: str = "XAUUSD",
 ) -> MTFAnalysis:
-    """
-    Run full top-down multi-timeframe analysis.
 
-    Returns MTFAnalysis with direction, entry zone, SL, TP levels,
-    and confidence score based on how many timeframes align.
-    """
+    # Default no-signal result
+    no_signal = lambda reason: MTFAnalysis(
+        weekly_bias=StructureBias.RANGING, weekly_draw_up=None, weekly_draw_down=None,
+        daily_bias=StructureBias.RANGING, pdh=0, pdl=0,
+        h4_bias=StructureBias.RANGING, h4_ob=None, h4_fvg=None,
+        h4_dealing_range_mid=None, h4_price_zone=None,
+        h1_entry_zone=None,
+        m15_choch=False, m15_choch_dir=None, m15_sweep=False,
+        m15_displacement=False, m15_disp_dir=None,
+        direction=SignalDirection.NONE, confidence=0, entry_price=None,
+        sl_price=None, tp1_price=None, tp2_price=None,
+        tp1_rr=0, tp2_rr=None, use_partial=False, reason=reason,
+    )
 
-    # =========================================================================
-    # WEEKLY — where's the draw?
-    # =========================================================================
-    weekly_structure = get_recent_structure(
+    # =====================================================================
+    # WEEKLY
+    # =====================================================================
+    if len(df_weekly) < 10:
+        return no_signal("Insufficient weekly data")
+
+    w_struct = get_recent_structure(
         df_weekly["high"], df_weekly["low"], df_weekly["close"],
         strength=2, lookback=20,
     )
-    weekly_swh, weekly_swl = weekly_structure.swing_highs, weekly_structure.swing_lows
-    weekly_pools = find_liquidity_pools(
-        df_weekly["high"], df_weekly["low"], weekly_swh, weekly_swl,
+    sessions = get_session_levels(df_1h)
+    w_pools = find_liquidity_pools(
+        df_weekly["high"], df_weekly["low"],
+        w_struct.swing_highs, w_struct.swing_lows,
     )
-    sessions = get_session_levels(df_1h)  # use 1H for session calc
-    weekly_draw_up, weekly_draw_down = find_draw_on_liquidity(
-        current_price, sessions, weekly_pools,
-    )
+    w_draw_up, w_draw_down = find_draw_on_liquidity(current_price, sessions, w_pools)
 
-    # =========================================================================
-    # DAILY — bias for the day
-    # =========================================================================
-    daily_structure = get_recent_structure(
+    # =====================================================================
+    # DAILY
+    # =====================================================================
+    if len(df_daily) < 15:
+        return no_signal("Insufficient daily data")
+
+    d_struct = get_recent_structure(
         df_daily["high"], df_daily["low"], df_daily["close"],
         strength=3, lookback=30,
+        open_=df_daily["open"] if "open" in df_daily else None,
     )
-    daily_obs = find_order_blocks(
-        df_daily["high"], df_daily["low"], df_daily["open"], df_daily["close"],
-        daily_structure.breaks,
-    )
-    # Most recent valid daily OB
-    daily_ob = None
-    for ob in reversed(daily_obs):
-        if ob.status != ZoneStatus.BROKEN:
-            daily_ob = ob
-            break
 
-    # =========================================================================
-    # 4H — current swing structure
-    # =========================================================================
-    h4_structure = get_recent_structure(
+    # =====================================================================
+    # 4H — structure + OBs + premium/discount
+    # =====================================================================
+    if len(df_4h) < 20:
+        return no_signal("Insufficient 4H data")
+
+    h4_struct = get_recent_structure(
         df_4h["high"], df_4h["low"], df_4h["close"],
         strength=3, lookback=50,
+        open_=df_4h["open"] if "open" in df_4h else None,
     )
     h4_obs = find_order_blocks(
         df_4h["high"], df_4h["low"], df_4h["open"], df_4h["close"],
-        h4_structure.breaks,
+        h4_struct.breaks,
     )
     h4_fvgs = find_fair_value_gaps(df_4h["high"], df_4h["low"], df_4h["close"])
-
-    # Update zone statuses
     h4_obs = update_zone_status(h4_obs, df_4h["high"], df_4h["low"], df_4h["close"])
     h4_fvgs = update_zone_status(h4_fvgs, df_4h["high"], df_4h["low"], df_4h["close"])
 
-    # Best 4H OB and FVG near price
-    h4_ob = None
-    h4_fvg = None
-    if h4_structure.bias == StructureBias.BULLISH:
-        h4_ob = find_entry_zone(h4_obs, current_price, "long")
-        h4_fvg = find_entry_zone(h4_fvgs, current_price, "long")
-    elif h4_structure.bias == StructureBias.BEARISH:
-        h4_ob = find_entry_zone(h4_obs, current_price, "short")
-        h4_fvg = find_entry_zone(h4_fvgs, current_price, "short")
+    # Premium / Discount
+    h4_dr = h4_struct.dealing_range
+    h4_price_zone = None
+    h4_dr_mid = None
+    if h4_dr:
+        h4_price_zone = h4_dr.zone_of(current_price)
+        h4_dr_mid = h4_dr.midpoint
 
-    # =========================================================================
-    # 1H — refined entry zone
-    # =========================================================================
-    h1_structure = get_recent_structure(
-        df_1h["high"], df_1h["low"], df_1h["close"],
-        strength=3, lookback=50,
-    )
+    # =====================================================================
+    # 1H — FVGs inside 4H OB for sniper entry
+    # =====================================================================
+    if len(df_1h) < 20:
+        return no_signal("Insufficient 1H data")
+
     h1_fvgs = find_fair_value_gaps(df_1h["high"], df_1h["low"], df_1h["close"])
     h1_fvgs = update_zone_status(h1_fvgs, df_1h["high"], df_1h["low"], df_1h["close"])
 
-    # Find 1H FVG inside the 4H OB — the sniper zone
-    h1_entry_zone = None
-    ref_zone = h4_ob or h4_fvg
-    if ref_zone:
-        for fvg in h1_fvgs:
-            if fvg.status == ZoneStatus.BROKEN:
-                continue
-            # 1H FVG overlaps with 4H zone
-            if fvg.top >= ref_zone.bottom and fvg.bottom <= ref_zone.top:
-                h1_entry_zone = fvg
-                break
+    # =====================================================================
+    # 15m — execution: CHoCH + sweep + displacement
+    # =====================================================================
+    if len(df_15m) < 30:
+        return no_signal("Insufficient 15m data")
 
-    if h1_entry_zone is None:
-        # Fallback: use the 4H zone directly
-        h1_entry_zone = ref_zone
-
-    # =========================================================================
-    # 15m — execution trigger
-    # =========================================================================
-    m15_structure = get_recent_structure(
+    m15_struct = get_recent_structure(
         df_15m["high"], df_15m["low"], df_15m["close"],
         strength=3, lookback=30,
+        open_=df_15m["open"] if "open" in df_15m else None,
     )
 
-    # Check for recent CHoCH on 15m (last 10 bars)
-    m15_choch = None
-    for brk in reversed(m15_structure.breaks):
-        if brk.break_type == BreakType.CHOCH:
-            if brk.index >= len(df_15m) - 15:  # within recent bars
-                m15_choch = brk
+    # CHoCH in last 10 bars
+    m15_choch = False
+    m15_choch_dir = None
+    for brk in reversed(m15_struct.breaks):
+        if brk.break_type == BreakType.CHOCH and brk.index >= len(df_15m) - 15:
+            m15_choch = True
+            m15_choch_dir = brk.direction
             break
 
-    # Check for liquidity sweep on 15m
-    m15_swh, m15_swl = m15_structure.swing_highs, m15_structure.swing_lows
+    # Sweep
     m15_pools = find_liquidity_pools(
-        df_15m["high"], df_15m["low"], m15_swh, m15_swl,
+        df_15m["high"], df_15m["low"],
+        m15_struct.swing_highs, m15_struct.swing_lows,
     )
-    m15_sweep = False
-    for pool in m15_pools:
-        if detect_sweep(pool, df_15m["high"], df_15m["low"], df_15m["close"], lookback=5):
-            m15_sweep = True
-            pool.status = SweepStatus.SWEPT
-            break
+    m15_sweep = any(detect_sweep(p, df_15m["high"], df_15m["low"], df_15m["close"], 5)
+                    for p in m15_pools)
 
-    # =========================================================================
-    # DERIVE: direction, confidence, levels
-    # =========================================================================
-    direction = SignalDirection.NONE
-    confidence = 0.0
-    entry_zone_price = None
-    sl_price = None
-    tp1_price = None
-    tp2_price = None
+    # Displacement
+    m15_disp = detect_displacement(
+        df_15m["open"], df_15m["high"], df_15m["low"], df_15m["close"],
+        lookback=5,
+        min_ratio=config.DISPLACEMENT_BODY_RATIO,
+    )
+    m15_displacement = m15_disp is not None
+    m15_disp_dir = m15_disp.direction if m15_disp else None
 
-    # Count alignment
-    bullish_score = 0
-    bearish_score = 0
+    # =====================================================================
+    # ALIGNMENT + SIGNAL
+    # =====================================================================
 
-    if weekly_structure.bias == StructureBias.BULLISH: bullish_score += 1
-    elif weekly_structure.bias == StructureBias.BEARISH: bearish_score += 1
+    # Count bullish/bearish alignment
+    bull = 0
+    bear = 0
+    reasons = []
 
-    if daily_structure.bias == StructureBias.BULLISH: bullish_score += 1
-    elif daily_structure.bias == StructureBias.BEARISH: bearish_score += 1
+    if w_struct.bias == StructureBias.BULLISH:
+        bull += 1; reasons.append("W=BULL")
+    elif w_struct.bias == StructureBias.BEARISH:
+        bear += 1; reasons.append("W=BEAR")
 
-    if h4_structure.bias == StructureBias.BULLISH: bullish_score += 1
-    elif h4_structure.bias == StructureBias.BEARISH: bearish_score += 1
+    if d_struct.bias == StructureBias.BULLISH:
+        bull += 1; reasons.append("D=BULL")
+    elif d_struct.bias == StructureBias.BEARISH:
+        bear += 1; reasons.append("D=BEAR")
+
+    if h4_struct.bias == StructureBias.BULLISH:
+        bull += 1; reasons.append("4H=BULL")
+    elif h4_struct.bias == StructureBias.BEARISH:
+        bear += 1; reasons.append("4H=BEAR")
 
     if m15_choch:
-        if m15_choch.direction == "bullish": bullish_score += 1
-        elif m15_choch.direction == "bearish": bearish_score += 1
+        if m15_choch_dir == "bullish":
+            bull += 1; reasons.append("15m CHoCH BULL")
+        elif m15_choch_dir == "bearish":
+            bear += 1; reasons.append("15m CHoCH BEAR")
+
+    if m15_displacement:
+        if m15_disp_dir == "bullish":
+            bull += 0.5; reasons.append("15m disp BULL")
+        elif m15_disp_dir == "bearish":
+            bear += 0.5; reasons.append("15m disp BEAR")
 
     if m15_sweep:
-        bullish_score += 0.5
-        bearish_score += 0.5  # sweep is directionally ambiguous until CHoCH confirms
+        reasons.append("15m sweep")
 
-    # Determine direction — need at least 3 timeframes aligned
-    if bullish_score >= 3 and h4_structure.bias == StructureBias.BULLISH:
+    # Requirements:
+    # 1. 4H must have clear bias (mandatory)
+    # 2. At least ONE higher TF (weekly or daily) agrees
+    # 3. 15m trigger: CHoCH or sweep
+    # This is more realistic than requiring 3+ TFs — gold's weekly/daily often disagree
+    has_trigger = m15_choch or m15_sweep
+    if config.REQUIRE_DISPLACEMENT and not m15_displacement:
+        has_trigger = False
+
+    # Higher TF confirmation: daily OR weekly agrees with 4H
+    htf_bull = d_struct.bias == StructureBias.BULLISH or w_struct.bias == StructureBias.BULLISH
+    htf_bear = d_struct.bias == StructureBias.BEARISH or w_struct.bias == StructureBias.BEARISH
+
+    direction = SignalDirection.NONE
+    entry_zone = None
+    sl = None
+    tp1 = None
+    tp2 = None
+    tp1_rr = 0.0
+    tp2_rr = None
+    use_partial = False
+
+    # Confidence: more alignment = bigger position
+    # 4H aligned + 1 HTF = base. + 15m CHoCH = bonus. + displacement = bonus.
+    # Per-instrument alignment check
+    strict = config.STRICT_ALIGNMENT.get(symbol, False) if hasattr(config, 'STRICT_ALIGNMENT') else False
+
+    if strict:
+        bull_aligned = (bull >= 3 and h4_struct.bias == StructureBias.BULLISH)
+        bear_aligned = (bear >= 3 and h4_struct.bias == StructureBias.BEARISH)
+    else:
+        bull_aligned = (h4_struct.bias == StructureBias.BULLISH and htf_bull)
+        bear_aligned = (h4_struct.bias == StructureBias.BEARISH and htf_bear)
+
+    if bull_aligned and has_trigger:
+        # Premium/Discount check — only long in discount
+        if config.PREMIUM_DISCOUNT_FILTER and h4_price_zone == PriceZone.PREMIUM:
+            return no_signal("LONG blocked — price in premium zone")
+
         direction = SignalDirection.LONG
-        confidence = min(1.0, bullish_score / 4.5)
 
-        if h1_entry_zone:
-            entry_zone_price = h1_entry_zone.midpoint
-            sl_price = h1_entry_zone.bottom - (h1_entry_zone.top - h1_entry_zone.bottom) * 0.5
+        # Find entry zone: 1H FVG inside 4H OB (sniper) or 4H OB alone
+        h4_ob = find_entry_zone(h4_obs, current_price, "long")
+        h4_fvg_zone = find_entry_zone(h4_fvgs, current_price, "long")
 
-        tp1_price = sessions.pdh if sessions.pdh > current_price else None
-        tp2_price = weekly_draw_up
+        # Look for 1H FVG inside the 4H OB
+        entry_zone = None
+        ref = h4_ob or h4_fvg_zone
+        if ref:
+            for fvg in h1_fvgs:
+                if fvg.status == ZoneStatus.BROKEN:
+                    continue
+                if fvg.zone_type in (ZoneType.BULLISH_FVG,) and \
+                   fvg.top >= ref.bottom and fvg.bottom <= ref.top:
+                    entry_zone = fvg
+                    reasons.append(f"1H FVG in 4H OB")
+                    break
 
-    elif bearish_score >= 3 and h4_structure.bias == StructureBias.BEARISH:
+        if entry_zone is None:
+            entry_zone = ref
+
+        if entry_zone:
+            sl = entry_zone.bottom - (entry_zone.top - entry_zone.bottom) * 0.3
+            risk = abs(current_price - sl)
+
+            # TP1: PDH if far enough, else next BSL
+            if sessions.pdh > current_price and abs(sessions.pdh - current_price) / risk >= config.PARTIAL_MIN_RR:
+                tp1 = sessions.pdh
+                use_partial = True
+                reasons.append(f"TP1=PDH {tp1:.2f}")
+            else:
+                # Skip partial, go straight to weekly draw
+                tp1 = w_draw_up or current_price + risk * 3
+                use_partial = False
+                reasons.append(f"TP=draw {tp1:.2f}")
+
+            tp2 = w_draw_up if w_draw_up and w_draw_up > tp1 else None
+            tp1_rr = abs(tp1 - current_price) / risk if risk > 0 else 0
+            tp2_rr = abs(tp2 - current_price) / risk if tp2 and risk > 0 else None
+
+    elif bear_aligned and has_trigger:
+        if config.PREMIUM_DISCOUNT_FILTER and h4_price_zone == PriceZone.DISCOUNT:
+            return no_signal("SHORT blocked — price in discount zone")
+
         direction = SignalDirection.SHORT
-        confidence = min(1.0, bearish_score / 4.5)
 
-        if h1_entry_zone:
-            entry_zone_price = h1_entry_zone.midpoint
-            sl_price = h1_entry_zone.top + (h1_entry_zone.top - h1_entry_zone.bottom) * 0.5
+        h4_ob = find_entry_zone(h4_obs, current_price, "short")
+        h4_fvg_zone = find_entry_zone(h4_fvgs, current_price, "short")
 
-        tp1_price = sessions.pdl if sessions.pdl < current_price else None
-        tp2_price = weekly_draw_down
+        entry_zone = None
+        ref = h4_ob or h4_fvg_zone
+        if ref:
+            for fvg in h1_fvgs:
+                if fvg.status == ZoneStatus.BROKEN:
+                    continue
+                if fvg.zone_type in (ZoneType.BEARISH_FVG,) and \
+                   fvg.bottom <= ref.top and fvg.top >= ref.bottom:
+                    entry_zone = fvg
+                    reasons.append(f"1H FVG in 4H OB")
+                    break
+
+        if entry_zone is None:
+            entry_zone = ref
+
+        if entry_zone:
+            sl = entry_zone.top + (entry_zone.top - entry_zone.bottom) * 0.3
+            risk = abs(current_price - sl)
+
+            if sessions.pdl < current_price and abs(current_price - sessions.pdl) / risk >= config.PARTIAL_MIN_RR:
+                tp1 = sessions.pdl
+                use_partial = True
+                reasons.append(f"TP1=PDL {tp1:.2f}")
+            else:
+                tp1 = w_draw_down or current_price - risk * 3
+                use_partial = False
+                reasons.append(f"TP=draw {tp1:.2f}")
+
+            tp2 = w_draw_down if w_draw_down and w_draw_down < tp1 else None
+            tp1_rr = abs(current_price - tp1) / risk if risk > 0 else 0
+            tp2_rr = abs(current_price - tp2) / risk if tp2 and risk > 0 else None
+
+    # Min R:R check
+    if direction != SignalDirection.NONE and tp1_rr < config.MIN_RISK_REWARD:
+        return no_signal(f"R:R too low ({tp1_rr:.1f} < {config.MIN_RISK_REWARD})")
+
+    # No entry zone found
+    if direction != SignalDirection.NONE and entry_zone is None:
+        return no_signal("No valid entry zone")
+
+    # Confidence based on confluence count
+    if direction != SignalDirection.NONE:
+        conf_score = max(bull, bear)
+        # Bonus for displacement
+        if m15_displacement:
+            conf_score += 0.5
+        # Bonus for both weekly AND daily agreeing
+        if (direction == SignalDirection.LONG and
+            w_struct.bias == StructureBias.BULLISH and d_struct.bias == StructureBias.BULLISH):
+            conf_score += 0.5
+        elif (direction == SignalDirection.SHORT and
+              w_struct.bias == StructureBias.BEARISH and d_struct.bias == StructureBias.BEARISH):
+            conf_score += 0.5
+        confidence = min(1.0, conf_score / 4.0)
+    else:
+        confidence = 0
 
     return MTFAnalysis(
-        weekly_bias=weekly_structure.bias,
-        weekly_draw_up=weekly_draw_up,
-        weekly_draw_down=weekly_draw_down,
-        daily_bias=daily_structure.bias,
-        pdh=sessions.pdh,
-        pdl=sessions.pdl,
-        daily_ob=daily_ob,
-        h4_bias=h4_structure.bias,
-        h4_structure=h4_structure,
-        h4_ob=h4_ob,
-        h4_fvg=h4_fvg,
-        h1_entry_zone=h1_entry_zone,
-        h1_fvgs=[f for f in h1_fvgs if f.status != ZoneStatus.BROKEN],
-        m15_choch=m15_choch,
-        m15_sweep=m15_sweep,
-        m15_structure=m15_structure,
-        direction=direction,
-        confidence=confidence,
-        entry_zone_price=entry_zone_price,
-        sl_price=sl_price,
-        tp1_price=tp1_price,
-        tp2_price=tp2_price,
+        weekly_bias=w_struct.bias, weekly_draw_up=w_draw_up, weekly_draw_down=w_draw_down,
+        daily_bias=d_struct.bias, pdh=sessions.pdh, pdl=sessions.pdl,
+        h4_bias=h4_struct.bias, h4_ob=h4_ob if direction != SignalDirection.NONE else None,
+        h4_fvg=h4_fvg_zone if direction != SignalDirection.NONE else None,
+        h4_dealing_range_mid=h4_dr_mid, h4_price_zone=h4_price_zone,
+        h1_entry_zone=entry_zone,
+        m15_choch=m15_choch, m15_choch_dir=m15_choch_dir,
+        m15_sweep=m15_sweep, m15_displacement=m15_displacement, m15_disp_dir=m15_disp_dir,
+        direction=direction, confidence=confidence,
+        entry_price=entry_zone.midpoint if entry_zone else None,
+        sl_price=sl, tp1_price=tp1, tp2_price=tp2,
+        tp1_rr=tp1_rr, tp2_rr=tp2_rr, use_partial=use_partial,
+        reason=" | ".join(reasons),
     )
