@@ -213,17 +213,26 @@ def run():
                 if ts not in d15.index: continue
                 p = pos[sym]
                 price = float(d15.loc[ts, "close"])
+                bh = float(d15.loc[ts, "high"])
+                bl = float(d15.loc[ts, "low"])
                 bars_held = bar - p["bar"]
-                close_it, reason = False, ""
+                close_it, reason, ep = False, "", price
 
-                if p["side"] == "long" and price <= p["sl"]: close_it, reason = True, "SL"
-                elif p["side"] == "short" and price >= p["sl"]: close_it, reason = True, "SL"
-                elif p["side"] == "long" and price >= p["tp"]: close_it, reason = True, "TP"
-                elif p["side"] == "short" and price <= p["tp"]: close_it, reason = True, "TP"
-                elif bars_held >= 60: close_it, reason = True, "Time"
+                # SL on wick
+                if p["side"] == "long" and bl <= p["sl"]: close_it, reason, ep = True, "SL", p["sl"]
+                elif p["side"] == "short" and bh >= p["sl"]: close_it, reason, ep = True, "SL", p["sl"]
+                # TP on wick
+                if not close_it:
+                    if p["side"] == "long" and bh >= p["tp"]: close_it, reason, ep = True, "TP", p["tp"]
+                    elif p["side"] == "short" and bl <= p["tp"]: close_it, reason, ep = True, "TP", p["tp"]
+                # Both hit — SL wins
+                if p["side"] == "long" and bl <= p["sl"] and bh >= p["tp"]: close_it, reason, ep = True, "SL", p["sl"]
+                elif p["side"] == "short" and bh >= p["sl"] and bl <= p["tp"]: close_it, reason, ep = True, "SL", p["sl"]
+                # Time
+                if not close_it and bars_held >= 60: close_it, reason, ep = True, "Time", price
 
                 if close_it:
-                    raw = ((price - p["entry"]) if p["side"] == "long" else (p["entry"] - price)) * p["lots"] * cfg["lot_mult"]
+                    raw = ((ep - p["entry"]) if p["side"] == "long" else (p["entry"] - ep)) * p["lots"] * cfg["lot_mult"]
                     c = cfg["comm"] * p["lots"]
                     equity += raw - c
                     tot_comm += c

@@ -171,27 +171,39 @@ def run_phased(symbol: str):
                 bars_held = current_bar - pos["bar"]
                 close_it = False
                 reason = ""
+                exit_price = price  # default to close
 
-                # SL
-                if pos["side"] == "long" and price <= pos["sl"]:
-                    close_it, reason = True, "SL"
-                elif pos["side"] == "short" and price >= pos["sl"]:
-                    close_it, reason = True, "SL"
+                # Use HIGH and LOW for SL/TP checks — wicks count in real trading
+                bar_high = float(w15["high"].iloc[-1])
+                bar_low = float(w15["low"].iloc[-1])
 
-                # TP
+                # SL — check against wick, exit at SL price (not close)
+                if pos["side"] == "long" and bar_low <= pos["sl"]:
+                    close_it, reason, exit_price = True, "SL", pos["sl"]
+                elif pos["side"] == "short" and bar_high >= pos["sl"]:
+                    close_it, reason, exit_price = True, "SL", pos["sl"]
+
+                # TP — check against wick, exit at TP price
                 if not close_it:
-                    if pos["side"] == "long" and price >= pos["tp"]:
-                        close_it, reason = True, "TP"
-                    elif pos["side"] == "short" and price <= pos["tp"]:
-                        close_it, reason = True, "TP"
+                    if pos["side"] == "long" and bar_high >= pos["tp"]:
+                        close_it, reason, exit_price = True, "TP", pos["tp"]
+                    elif pos["side"] == "short" and bar_low <= pos["tp"]:
+                        close_it, reason, exit_price = True, "TP", pos["tp"]
 
-                # Time stop
+                # Check if BOTH SL and TP hit on same bar — SL takes priority (worst case)
+                # This happens on big wicks. Assume SL hit first.
+                if pos["side"] == "long" and bar_low <= pos["sl"] and bar_high >= pos["tp"]:
+                    close_it, reason, exit_price = True, "SL", pos["sl"]
+                elif pos["side"] == "short" and bar_high >= pos["sl"] and bar_low <= pos["tp"]:
+                    close_it, reason, exit_price = True, "SL", pos["sl"]
+
+                # Time stop — exits at close price
                 if not close_it and bars_held >= 60:
-                    close_it, reason = True, "Time"
+                    close_it, reason, exit_price = True, "Time", price
 
                 if close_it:
-                    raw = ((price - pos["entry"]) if pos["side"] == "long" else
-                           (pos["entry"] - price)) * pos["lots"] * lot_mult
+                    raw = ((exit_price - pos["entry"]) if pos["side"] == "long" else
+                           (pos["entry"] - exit_price)) * pos["lots"] * lot_mult
                     c = comm * pos["lots"]
                     net = raw - c
                     equity += net

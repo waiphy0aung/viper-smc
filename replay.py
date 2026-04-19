@@ -69,18 +69,26 @@ def run_bt(sym, cfg, tf):
 
         if pos:
             bars = i - pos["bar"]
-            hit = False; reason = ""
-            if pos["side"]=="long" and price<=pos["sl"]: hit,reason=True,"SL"
-            elif pos["side"]=="short" and price>=pos["sl"]: hit,reason=True,"SL"
-            elif pos["side"]=="long" and price>=pos["tp"]: hit,reason=True,"TP"
-            elif pos["side"]=="short" and price<=pos["tp"]: hit,reason=True,"TP"
-            elif bars>=60: hit,reason=True,"Time"
+            hit = False; reason = ""; ep = price
+            bh = float(w15["high"].iloc[-1]); bl = float(w15["low"].iloc[-1])
+            # SL on wick
+            if pos["side"]=="long" and bl<=pos["sl"]: hit,reason,ep=True,"SL",pos["sl"]
+            elif pos["side"]=="short" and bh>=pos["sl"]: hit,reason,ep=True,"SL",pos["sl"]
+            # TP on wick
+            if not hit:
+                if pos["side"]=="long" and bh>=pos["tp"]: hit,reason,ep=True,"TP",pos["tp"]
+                elif pos["side"]=="short" and bl<=pos["tp"]: hit,reason,ep=True,"TP",pos["tp"]
+            # Both hit same bar — SL wins (worst case)
+            if pos["side"]=="long" and bl<=pos["sl"] and bh>=pos["tp"]: hit,reason,ep=True,"SL",pos["sl"]
+            elif pos["side"]=="short" and bh>=pos["sl"] and bl<=pos["tp"]: hit,reason,ep=True,"SL",pos["sl"]
+            # Time stop
+            if not hit and bars>=60: hit,reason,ep=True,"Time",price
             if hit:
-                raw=((price-pos["entry"]) if pos["side"]=="long" else (pos["entry"]-price))*pos["lots"]*cfg["lot_mult"]
+                raw=((ep-pos["entry"]) if pos["side"]=="long" else (pos["entry"]-ep))*pos["lots"]*cfg["lot_mult"]
                 pnl=raw-cfg["comm"]*pos["lots"]
                 equity+=pnl
                 trades.append({"bar_idx":i,"entry_time":str(pos["entry_time"])[:19],"exit_time":str(ts)[:19],
-                    "entry_price":pos["entry"],"exit_price":price,"sl":pos["sl"],"tp":pos["tp"],
+                    "entry_price":pos["entry"],"exit_price":ep,"sl":pos["sl"],"tp":pos["tp"],
                     "side":pos["side"],"pnl":round(pnl,2),"reason":reason})
                 pos=None
 
