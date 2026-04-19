@@ -19,9 +19,9 @@ from liquidity import get_session_levels, find_liquidity_pools, LiquidityType
 logging.basicConfig(level=logging.WARNING)
 
 PAIR_CFG = {
-    "GBPUSD": {"ticker": "GBPUSD=X", "spread": 0.00015, "lot_mult": 100000, "min_sl": 0.0005, "comm": 5.0},
-    "US30":   {"ticker": "YM=F",     "spread": 2.0,     "lot_mult": 5,      "min_sl": 20.0,   "comm": 3.0},
-    "SP500":  {"ticker": "ES=F",     "spread": 0.5,     "lot_mult": 50,     "min_sl": 5.0,    "comm": 3.0},
+    "GBPUSD": {"ticker": "GBPUSD=X", "spread": 0.00015, "lot_mult": 100000, "min_sl": 0.0008, "comm": 5.0},
+    "US30":   {"ticker": "YM=F",     "spread": 2.0,     "lot_mult": 5,      "min_sl": 25.0,   "comm": 3.0},
+    "SP500":  {"ticker": "ES=F",     "spread": 0.5,     "lot_mult": 50,     "min_sl": 8.0,    "comm": 3.0},
 }
 
 
@@ -124,10 +124,10 @@ def find_entry(symbol: str, w15, w1h, w4h, wd, ww, price, cfg) -> dict | None:
         if zh > min_sl * 10: zh = min_sl * 5  # cap wide zones
 
         if side == "long":
-            sl = zone.bottom - zh * 0.3
+            sl = zone.bottom - zh * 0.5
             sl = min(sl, zone.bottom - min_sl)
         else:
-            sl = zone.top + zh * 0.3
+            sl = zone.top + zh * 0.5
             sl = max(sl, zone.top + min_sl)
 
         risk = abs(price - sl)

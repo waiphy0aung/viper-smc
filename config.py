@@ -23,9 +23,8 @@ EQUITY_FLOOR = ACCOUNT_SIZE * (1 - MAX_DD_LIMIT)
 # =============================================================================
 # INSTRUMENTS
 # =============================================================================
-# Top 3 from multi-pair scan: GBPUSD (PF 2.21), US30 (PF 1.54), SP500 (PF 1.46)
-SYMBOLS = ["GBPUSD", "US30", "SP500"]
-SYMBOL_DISPLAY = {"GBPUSD": "GBPUSD", "US30": "US30", "SP500": "SP500"}
+SYMBOLS = ["US30", "SP500"]
+SYMBOL_DISPLAY = {"US30": "US30", "SP500": "SP500"}
 
 # =============================================================================
 # KILLZONES — tight institutional windows, not wide sessions

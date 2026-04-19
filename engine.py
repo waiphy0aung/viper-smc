@@ -153,8 +153,8 @@ def identify_pois(
             else:
                 effective_bottom = zone.bottom
 
-            sl = effective_bottom - zone_height * 0.3
-            sl = min(sl, effective_bottom - 5)  # minimum 5 pts below zone
+            sl = effective_bottom - zone_height * 0.5
+            sl = min(sl, effective_bottom - 5)
 
             # TP: use nearest realistic target
             risk = abs(zone.midpoint - sl)
@@ -201,7 +201,7 @@ def identify_pois(
             else:
                 effective_top = zone.top
 
-            sl = effective_top + zone_height * 0.3
+            sl = effective_top + zone_height * 0.5
             sl = max(sl, effective_top + 5)
 
             risk = abs(sl - zone.midpoint)
@@ -241,19 +241,14 @@ def check_confirmation(
     zone = poi.zone
     zone_height = zone.top - zone.bottom
 
-    # Is price in the zone?
-    if not (zone.bottom * 0.999 <= current_price <= zone.top * 1.001):
-        return None
-
-    # For longs: want price in the BOTTOM 50% of zone (deeper = better fill)
-    # For shorts: want price in the TOP 50% of zone
+    # Price must be NEAR the zone (within zone or just exited)
+    # Not necessarily inside — we enter AFTER the rejection, not during
+    zone_buffer = zone_height * 0.5
     if poi.direction == "long":
-        zone_depth = (zone.top - current_price) / zone_height if zone_height > 0 else 0
-        if zone_depth < 0.25:
+        if current_price > zone.top + zone_buffer or current_price < zone.bottom - zone_buffer:
             return None
     elif poi.direction == "short":
-        zone_depth = (current_price - zone.bottom) / zone_height if zone_height > 0 else 0
-        if zone_depth < 0.25:
+        if current_price < zone.bottom - zone_buffer or current_price > zone.top + zone_buffer:
             return None
 
     recent_15m = df_15m.iloc[-20:]
@@ -265,29 +260,39 @@ def check_confirmation(
     o = recent_15m["open"]
     c = recent_15m["close"]
 
-    # Check for rejection: at least one recent candle wicked into zone and closed back
+    # Rejection must be on a COMPLETED candle (index -2 or earlier)
+    # Current candle (-1) must be moving AWAY from the zone (confirming the rejection)
     rejection = False
-    for i in range(-1, -6, -1):
+    for i in range(-2, -6, -1):  # start at -2, not -1
         if i < -len(c):
             break
         bar_o = float(o.iloc[i])
         bar_c = float(c.iloc[i])
         bar_h = float(h.iloc[i])
         bar_l = float(l.iloc[i])
-        body = abs(bar_c - bar_o)
         total = bar_h - bar_l
         if total == 0:
             continue
 
         if poi.direction == "long":
             lower_wick = min(bar_o, bar_c) - bar_l
-            if lower_wick / total > 0.3 and bar_c > bar_o:  # bullish rejection
-                rejection = True
+            body = abs(bar_c - bar_o)
+            # Strong rejection: big wick (40%+) AND meaningful body (20%+)
+            if lower_wick / total > 0.4 and body / total > 0.2 and bar_c > bar_o and bar_l <= zone.top:
+                # Confirm: current candle is bullish (moving away from zone)
+                curr_c = float(c.iloc[-1])
+                curr_o = float(o.iloc[-1])
+                if curr_c > curr_o:  # current candle is green
+                    rejection = True
                 break
         elif poi.direction == "short":
             upper_wick = bar_h - max(bar_o, bar_c)
-            if upper_wick / total > 0.3 and bar_c < bar_o:  # bearish rejection
-                rejection = True
+            body = abs(bar_c - bar_o)
+            if upper_wick / total > 0.4 and body / total > 0.2 and bar_c < bar_o and bar_h >= zone.bottom:
+                curr_c = float(c.iloc[-1])
+                curr_o = float(o.iloc[-1])
+                if curr_c < curr_o:  # current candle is red
+                    rejection = True
                 break
 
     # Check for sweep and displacement
@@ -314,9 +319,21 @@ def check_confirmation(
     if not rejection and not sweep_confirmed and not displacement_confirmed:
         return None
 
-    # Entry at current price (already deep in the zone)
+    # Entry at current price (after rejection confirmed)
     entry = current_price
-    sl = poi.sl_price
+
+    # SL behind the rejection wick — the actual extreme that held
+    # This is tighter than the zone-based SL but more logical
+    recent_lows = [float(l.iloc[i]) for i in range(-5, 0) if i >= -len(l)]
+    recent_highs = [float(h.iloc[i]) for i in range(-5, 0) if i >= -len(h)]
+
+    if poi.direction == "long":
+        wick_low = min(recent_lows) if recent_lows else poi.sl_price
+        sl = min(wick_low - (zone_height * 0.2), poi.sl_price)  # behind wick with small buffer
+    else:
+        wick_high = max(recent_highs) if recent_highs else poi.sl_price
+        sl = max(wick_high + (zone_height * 0.2), poi.sl_price)
+
     tp = poi.target
 
     risk = abs(entry - sl)
@@ -376,14 +393,12 @@ def scan_for_setup(
     d_struct = get_recent_structure(df_daily["high"], df_daily["low"], df_daily["close"], 3, 30)
     w_struct = get_recent_structure(df_weekly["high"], df_weekly["low"], df_weekly["close"], 2, 20)
 
-    # Alignment check
-    strict = config.STRICT_ALIGNMENT.get(symbol, False)
-    # Alignment: 4H is mandatory. Daily OR weekly must agree.
-    # Weekly is less relevant for intraday gold — daily + 4H is the real combo.
+    # Alignment: 4H + daily must AGREE. Not just "not oppose."
+    # This is the tightest filter but produces the highest WR.
     htf_bull = (h4_struct.bias == StructureBias.BULLISH and
-                d_struct.bias != StructureBias.BEARISH)  # daily not bearish (bullish or ranging OK)
+                d_struct.bias == StructureBias.BULLISH)
     htf_bear = (h4_struct.bias == StructureBias.BEARISH and
-                d_struct.bias != StructureBias.BULLISH)  # daily not bullish
+                d_struct.bias == StructureBias.BEARISH)
 
     if not htf_bull and not htf_bear:
         return None
