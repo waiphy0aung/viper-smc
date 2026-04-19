@@ -109,7 +109,16 @@ def identify_pois(
     )
     h4_obs = update_zone_status(h4_obs, df_4h["high"], df_4h["low"], df_4h["close"])
 
-    # 1H FVGs
+    # 1H FVGs + 1H OBs
+    h1_struct = get_recent_structure(
+        df_1h["high"], df_1h["low"], df_1h["close"], 3, 50,
+        df_1h["open"] if "open" in df_1h else None,
+    )
+    h1_obs = find_order_blocks(
+        df_1h["high"], df_1h["low"], df_1h["open"], df_1h["close"],
+        h1_struct.breaks, lookback_bars=10,
+    )
+    h1_obs = update_zone_status(h1_obs, df_1h["high"], df_1h["low"], df_1h["close"])
     h1_fvgs = find_fair_value_gaps(df_1h["high"], df_1h["low"], df_1h["close"])
     h1_fvgs = update_zone_status(h1_fvgs, df_1h["high"], df_1h["low"], df_1h["close"])
 
@@ -125,7 +134,7 @@ def identify_pois(
     max_zone_height = 50.0  # filter out massive OBs — use 50% of zone instead
 
     if h4_bias == StructureBias.BULLISH:
-        for zone in h4_obs + h1_fvgs:
+        for zone in h4_obs + h1_obs + h1_fvgs:
             if zone.status == ZoneStatus.BROKEN:
                 continue
             if zone.zone_type not in (ZoneType.BULLISH_OB, ZoneType.BULLISH_FVG):
@@ -172,8 +181,9 @@ def identify_pois(
             tf_label = "4h" if zone in h4_obs else "1h"
             pois.append(POI(zone=zone, direction="long", timeframe=tf_label, sl_price=sl, target=tp))
 
+
     elif h4_bias == StructureBias.BEARISH:
-        for zone in h4_obs + h1_fvgs:
+        for zone in h4_obs + h1_obs + h1_fvgs:
             if zone.status == ZoneStatus.BROKEN:
                 continue
             if zone.zone_type not in (ZoneType.BEARISH_OB, ZoneType.BEARISH_FVG):
@@ -229,12 +239,23 @@ def check_confirmation(
     Confirmation = 15m sweep of local liquidity + displacement candle.
     """
     zone = poi.zone
+    zone_height = zone.top - zone.bottom
 
     # Is price in the zone?
     if not (zone.bottom * 0.999 <= current_price <= zone.top * 1.001):
         return None
 
-    # Find 15m swing points local to the zone
+    # For longs: want price in the BOTTOM 50% of zone (deeper = better fill)
+    # For shorts: want price in the TOP 50% of zone
+    if poi.direction == "long":
+        zone_depth = (zone.top - current_price) / zone_height if zone_height > 0 else 0
+        if zone_depth < 0.25:
+            return None
+    elif poi.direction == "short":
+        zone_depth = (current_price - zone.bottom) / zone_height if zone_height > 0 else 0
+        if zone_depth < 0.25:
+            return None
+
     recent_15m = df_15m.iloc[-20:]
     if len(recent_15m) < 10:
         return None
@@ -244,7 +265,32 @@ def check_confirmation(
     o = recent_15m["open"]
     c = recent_15m["close"]
 
-    # Check for 15m confirmation (optional — adds quality but doesn't block)
+    # Check for rejection: at least one recent candle wicked into zone and closed back
+    rejection = False
+    for i in range(-1, -6, -1):
+        if i < -len(c):
+            break
+        bar_o = float(o.iloc[i])
+        bar_c = float(c.iloc[i])
+        bar_h = float(h.iloc[i])
+        bar_l = float(l.iloc[i])
+        body = abs(bar_c - bar_o)
+        total = bar_h - bar_l
+        if total == 0:
+            continue
+
+        if poi.direction == "long":
+            lower_wick = min(bar_o, bar_c) - bar_l
+            if lower_wick / total > 0.3 and bar_c > bar_o:  # bullish rejection
+                rejection = True
+                break
+        elif poi.direction == "short":
+            upper_wick = bar_h - max(bar_o, bar_c)
+            if upper_wick / total > 0.3 and bar_c < bar_o:  # bearish rejection
+                rejection = True
+                break
+
+    # Check for sweep and displacement
     sh, sl_pts = find_swing_points(h, l, 2)
     pools = find_liquidity_pools(h, l, sh, sl_pts)
     sweep_confirmed = any(detect_sweep(p, h, l, c, 5) for p in pools)
@@ -256,15 +302,19 @@ def check_confirmation(
     elif poi.direction == "short" and disp and disp.direction != "bearish":
         displacement_confirmed = False
 
-    # Quality grading — enter at the zone regardless, quality affects lot size
+    # Quality grading
     if sweep_confirmed and displacement_confirmed:
         quality = SetupQuality.A_PLUS
-    elif sweep_confirmed or displacement_confirmed:
+    elif sweep_confirmed or displacement_confirmed or rejection:
         quality = SetupQuality.A
     else:
-        quality = SetupQuality.B  # zone touch only — still valid, smaller size
+        quality = SetupQuality.B
 
-    # Entry, SL, TP
+    # Must have at least rejection OR sweep OR displacement
+    if not rejection and not sweep_confirmed and not displacement_confirmed:
+        return None
+
+    # Entry at current price (already deep in the zone)
     entry = current_price
     sl = poi.sl_price
     tp = poi.target
@@ -273,9 +323,8 @@ def check_confirmation(
     reward = abs(tp - entry)
     rr = reward / risk if risk > 0 else 0
 
-    if risk < 3:  # minimum 3 points SL for gold
+    if risk < 3:
         return None
-
     if rr < 1.5:
         return None
 
@@ -329,14 +378,12 @@ def scan_for_setup(
 
     # Alignment check
     strict = config.STRICT_ALIGNMENT.get(symbol, False)
-    if strict:
-        htf_bull = (h4_struct.bias == d_struct.bias == w_struct.bias == StructureBias.BULLISH)
-        htf_bear = (h4_struct.bias == d_struct.bias == w_struct.bias == StructureBias.BEARISH)
-    else:
-        htf_bull = (h4_struct.bias == StructureBias.BULLISH and
-                    (d_struct.bias == StructureBias.BULLISH or w_struct.bias == StructureBias.BULLISH))
-        htf_bear = (h4_struct.bias == StructureBias.BEARISH and
-                    (d_struct.bias == StructureBias.BEARISH or w_struct.bias == StructureBias.BEARISH))
+    # Alignment: 4H is mandatory. Daily OR weekly must agree.
+    # Weekly is less relevant for intraday gold — daily + 4H is the real combo.
+    htf_bull = (h4_struct.bias == StructureBias.BULLISH and
+                d_struct.bias != StructureBias.BEARISH)  # daily not bearish (bullish or ranging OK)
+    htf_bear = (h4_struct.bias == StructureBias.BEARISH and
+                d_struct.bias != StructureBias.BULLISH)  # daily not bullish
 
     if not htf_bull and not htf_bear:
         return None
