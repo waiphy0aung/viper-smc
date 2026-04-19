@@ -18,9 +18,7 @@ import ccxt
 import yfinance as yf
 
 import config
-from structure import StructureBias, get_recent_structure
-from liquidity import get_session_levels
-from entry_model import find_active_setup
+from engine import scan_for_setup, SetupQuality
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -151,6 +149,7 @@ def run_phased(symbol: str):
             loc = df_15m.index.get_loc(ts)
 
             w15 = df_15m.iloc[max(0, loc - 199):loc + 1]
+            w1h = tf["1h"].loc[:ts].iloc[-100:] if "1h" in tf else pd.DataFrame()
             w4h = df_4h.loc[:ts].iloc[-100:]
             w_daily = df_daily.loc[:ts].iloc[-60:]
             w_weekly = df_weekly.loc[:ts].iloc[-30:]
@@ -227,95 +226,36 @@ def run_phased(symbol: str):
                 dd_util = (1.0 - equity / config.ACCOUNT_SIZE) / config.MAX_DD_LIMIT if equity < config.ACCOUNT_SIZE else 0
                 throttle = max(0.25, 1.0 - dd_util * 0.9)
 
-                # HTF bias
-                h4_struct = get_recent_structure(w4h["high"], w4h["low"], w4h["close"], 3, 50,
-                                                  w4h["open"] if "open" in w4h else None)
-                d_struct = get_recent_structure(w_daily["high"], w_daily["low"], w_daily["close"], 3, 30)
-                w_struct = get_recent_structure(w_weekly["high"], w_weekly["low"], w_weekly["close"], 2, 20)
-
-                if strict:
-                    htf_bull = (h4_struct.bias == StructureBias.BULLISH and
-                                d_struct.bias == StructureBias.BULLISH and
-                                w_struct.bias == StructureBias.BULLISH)
-                    htf_bear = (h4_struct.bias == StructureBias.BEARISH and
-                                d_struct.bias == StructureBias.BEARISH and
-                                w_struct.bias == StructureBias.BEARISH)
-                else:
-                    htf_bull = (h4_struct.bias == StructureBias.BULLISH and
-                                (d_struct.bias == StructureBias.BULLISH or w_struct.bias == StructureBias.BULLISH))
-                    htf_bear = (h4_struct.bias == StructureBias.BEARISH and
-                                (d_struct.bias == StructureBias.BEARISH or w_struct.bias == StructureBias.BEARISH))
-
-                if not htf_bull and not htf_bear:
-                    eq_curve.append(equity)
-                    current_bar += 1
-                    continue
-
-                # Premium/Discount from 4H dealing range
-                if h4_struct.dealing_range:
-                    zone = h4_struct.dealing_range.zone_of(price)
-                    if config.PREMIUM_DISCOUNT_FILTER:
-                        if htf_bull and zone.value == "PREMIUM":
-                            eq_curve.append(equity)
-                            current_bar += 1
-                            continue
-                        if htf_bear and zone.value == "DISCOUNT":
-                            eq_curve.append(equity)
-                            current_bar += 1
-                            continue
-
-                # ICT Entry Model: find sweep → displacement → FVG
-                setup = find_active_setup(
-                    w15["high"], w15["low"], w15["open"], w15["close"],
-                    price, lookback=30,
-                )
+                # Staged SMC engine: POI → price at zone → confirmation
+                setup = scan_for_setup(w_weekly, w_daily, w4h, w1h, w15, price, symbol)
 
                 if setup is None:
                     eq_curve.append(equity)
                     current_bar += 1
                     continue
 
-                # Validate direction matches HTF bias
-                if setup.sweep_direction == "bullish_sweep" and not htf_bull:
-                    eq_curve.append(equity)
-                    current_bar += 1
-                    continue
-                if setup.sweep_direction == "bearish_sweep" and not htf_bear:
-                    eq_curve.append(equity)
-                    current_bar += 1
-                    continue
-
-                if setup.rr < config.MIN_RISK_REWARD:
-                    eq_curve.append(equity)
-                    current_bar += 1
-                    continue
-
-                # Position sizing — capped to prevent blowups on tight SL setups
+                # Position sizing from zone-based SL (wider = safer)
                 risk_dist = setup.risk
-                if risk_dist < 1.0:
-                    # SL is too tight (< 1 point) — skip, likely noise
+                if risk_dist < 3:
                     eq_curve.append(equity)
                     current_bar += 1
                     continue
 
-                conf = min(1.0, setup.rr / 5.0)
+                # Confidence from setup quality
+                conf_map = {SetupQuality.A_PLUS: 1.0, SetupQuality.A: 0.75, SetupQuality.B: 0.5}
+                conf = conf_map.get(setup.quality, 0.5)
                 risk_d = equity * config.MAX_RISK_PER_TRADE * conf * throttle
-
-                # Hard cap: never risk more than 2% regardless of confidence/throttle
-                risk_d = min(risk_d, equity * 0.02)
+                risk_d = min(risk_d, equity * 0.02)  # hard cap 2%
 
                 lots = round(risk_d / (risk_dist * lot_mult), 2)
                 lots = max(lots, 0.01)
-                # Max lot cap per instrument
-                max_lots = {"XAUUSD": 0.10, "NAS100": 0.50}.get(symbol, 0.10)
-                lots = min(lots, max_lots)
+                lots = min(lots, {"XAUUSD": 0.10, "NAS100": 0.50}.get(symbol, 0.10))
 
-                side = "long" if setup.sweep_direction == "bullish_sweep" else "short"
-                fill = price + spread if side == "long" else price - spread
+                fill = price + spread if setup.direction == "long" else price - spread
 
                 pos = {
-                    "side": side, "entry": fill,
-                    "sl": setup.sl_price, "tp": setup.target_price,
+                    "side": setup.direction, "entry": fill,
+                    "sl": setup.sl, "tp": setup.tp,
                     "lots": lots, "bar": current_bar, "risk_d": risk_d,
                 }
 
