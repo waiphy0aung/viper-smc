@@ -232,6 +232,7 @@ def show_chart(symbol: str):
 
     eq_df = pd.DataFrame(eq_data)
     eq_df["time"] = pd.to_datetime(eq_df["time"]).dt.tz_localize(None)
+    eq_df = eq_df.rename(columns={"value": "Equity"})
     eq_line = eq_chart.create_line(name="Equity", color="#00d4aa", width=2)
     eq_line.set(eq_df)
 
