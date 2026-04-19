@@ -229,17 +229,19 @@ def show_chart(symbol: str):
 
     # Equity subchart
     eq_chart = chart.create_subchart(width=1.0, height=0.3, position="bottom")
-    eq_chart.title("Equity Curve")
 
     eq_df = pd.DataFrame(eq_data)
     eq_df["time"] = pd.to_datetime(eq_df["time"]).dt.tz_localize(None)
     eq_line = eq_chart.create_line(name="Equity", color="#00d4aa", width=2)
     eq_line.set(eq_df)
 
-    # Target line
-    target_val = config.ACCOUNT_SIZE * (1 + config.PROFIT_TARGET_PHASE1)
-    eq_chart.horizontal_line(target_val, color="gold", width=1, style="dashed", text="Phase 1 Target")
-    eq_chart.horizontal_line(config.EQUITY_FLOOR, color="red", width=1, style="dashed", text="DD Floor")
+    # Target and floor lines
+    try:
+        target_val = config.ACCOUNT_SIZE * (1 + config.PROFIT_TARGET_PHASE1)
+        eq_chart.horizontal_line(target_val, color="gold", width=1, style="dashed", text="Target")
+        eq_chart.horizontal_line(config.EQUITY_FLOOR, color="red", width=1, style="dashed", text="Floor")
+    except Exception:
+        pass  # some versions don't support horizontal_line on subcharts
 
     print(f"\n  Showing chart... (close window to exit)")
     chart.show(block=True)
