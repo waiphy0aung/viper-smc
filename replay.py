@@ -422,8 +422,10 @@ window.addEventListener('resize', () => {{
     eqChart.resize(eqEl.clientWidth, eqEl.clientHeight);
 }});
 
-// Start with all data shown
-showAll();
+// Start empty — ready for replay
+currentIdx = 0;
+allMarkers = [];
+document.getElementById('progress').textContent = 'Press Play to start replay';
 </script>
 </body>
 </html>"""
