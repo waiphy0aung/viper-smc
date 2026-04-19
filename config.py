@@ -23,19 +23,18 @@ EQUITY_FLOOR = ACCOUNT_SIZE * (1 - MAX_DD_LIMIT)
 # =============================================================================
 # INSTRUMENTS
 # =============================================================================
-SYMBOLS = ["XAUUSD", "NAS100"]
-SYMBOL_DISPLAY = {"XAUUSD": "XAUUSD", "NAS100": "NAS100"}
+# Top 3 from multi-pair scan: GBPUSD (PF 2.21), US30 (PF 1.54), SP500 (PF 1.46)
+SYMBOLS = ["GBPUSD", "US30", "SP500"]
+SYMBOL_DISPLAY = {"GBPUSD": "GBPUSD", "US30": "US30", "SP500": "SP500"}
 
 # =============================================================================
 # KILLZONES — tight institutional windows, not wide sessions
 # =============================================================================
 SESSION_FILTER_ENABLED = True
 SESSION_WINDOWS = {
-    # London open killzone: 07:00-10:00 UTC (02:00-05:00 EST)
-    # NY open killzone: 13:00-16:00 UTC (08:00-11:00 EST)
-    # London killzone + NY killzone — slightly wider for gold
-    "XAUUSD": [(7, 11), (13, 17)],
-    "NAS100": [(13, 17)],
+    "GBPUSD": [(7, 11), (13, 17)],   # London + NY — GBP moves both sessions
+    "US30":   [(13, 17)],              # NY session only
+    "SP500":  [(13, 17)],              # NY session only
 }
 
 # =============================================================================
@@ -49,8 +48,9 @@ PREMIUM_DISCOUNT_FILTER = True
 # Gold: 4H + 1 HTF (more flexible — gold trends intraday against daily)
 # NAS100: 4H + daily + weekly must agree (NAS respects higher TF more)
 STRICT_ALIGNMENT = {
-    "XAUUSD": False,   # 4H + one of weekly/daily
-    "NAS100": True,    # 4H + daily + weekly all agree
+    "GBPUSD": False,   # 4H + daily not opposing
+    "US30":   False,
+    "SP500":  False,
 }
 
 # =============================================================================
@@ -72,12 +72,13 @@ PARTIAL_MIN_RR = 1.5           # minimum R:R to TP1 for partial close
 
 # Per-instrument lot multiplier
 LOT_DOLLAR_PER_POINT = {
-    "XAUUSD": 100,
-    "NAS100": 20,
+    "GBPUSD": 100000,  # $10 per pip per 0.1 lot
+    "US30":   5,        # $5 per point per 1 lot
+    "SP500":  50,       # $50 per point per 1 lot
 }
 
 # Spread
-SPREAD_POINTS = {"XAUUSD": 2.5, "NAS100": 1.5}
+SPREAD_POINTS = {"GBPUSD": 0.00015, "US30": 2.0, "SP500": 0.5}
 
 # =============================================================================
 # STRUCTURE DETECTION
@@ -104,8 +105,9 @@ STRUCTURE_LOOKBACK = {
 # DATA SOURCE
 # =============================================================================
 SYMBOL_DATA = {
-    "XAUUSD": {"ccxt_exchange": "bybit", "ccxt_symbol": "XAU/USDT:USDT", "yf_ticker": "GC=F"},
-    "NAS100": {"ccxt_exchange": None, "ccxt_symbol": None, "yf_ticker": "NQ=F"},
+    "GBPUSD": {"ccxt_exchange": None, "ccxt_symbol": None, "yf_ticker": "GBPUSD=X"},
+    "US30":   {"ccxt_exchange": None, "ccxt_symbol": None, "yf_ticker": "YM=F"},
+    "SP500":  {"ccxt_exchange": None, "ccxt_symbol": None, "yf_ticker": "ES=F"},
 }
 
 # =============================================================================
