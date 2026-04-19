@@ -141,10 +141,11 @@ def run_bt(sym, cfg, tf):
     return trades, eq_data, d15
 
 
-def generate_html(sym, ohlcv_data, trades, eq_data):
+def generate_html(sym, all_tf_candles, trades, eq_data):
     """Generate standalone HTML with TradingView Lightweight Charts + replay."""
 
-    candles_json = json.dumps(ohlcv_data)
+    all_tf_json = json.dumps(all_tf_candles)
+    candles_json = json.dumps(all_tf_candles["15m"])
     trades_json = json.dumps(trades)
     equity_json = json.dumps(eq_data)
     total_pnl = sum(t["pnl"] for t in trades)
@@ -165,7 +166,10 @@ body {{ background:#0a0a0a; color:#ddd; font-family:'Segoe UI',system-ui,sans-se
 #stats .win {{ color:#00d4aa; }} #stats .loss {{ color:#ff4757; }}
 #controls {{ padding:8px 20px; background:#111; display:flex; gap:12px; align-items:center; border-bottom:1px solid #222; }}
 button {{ background:#222; color:#ddd; border:1px solid #333; padding:6px 16px; cursor:pointer; border-radius:4px; font-size:13px; }}
-button:hover {{ background:#333; }} button.active {{ background:#00d4aa; color:#000; }}
+button:hover {{ background:#333; }}
+button.active {{ background:#00d4aa; color:#000; }}
+.tf-btn {{ padding:6px 12px; min-width:36px; }}
+.tf-btn.active {{ background:#2962ff; color:#fff; border-color:#2962ff; }}
 #speed {{ color:#888; font-size:13px; }}
 #chart-container {{ width:100%; height:calc(100vh - 160px); }}
 #equity-container {{ width:100%; height:120px; border-top:1px solid #222; }}
@@ -195,7 +199,13 @@ button:hover {{ background:#333; }} button.active {{ background:#00d4aa; color:#
     <button onclick="skipToTrade(-1)">⏮ Prev Trade</button>
     <button onclick="skipToTrade(1)">⏭ Next Trade</button>
     <button onclick="showAll()">Show All</button>
-    <span id="speed">Speed: 5x</span>
+    <span style="margin-left:16px;color:#555">|</span>
+    <button onclick="switchTF('15m')" class="tf-btn active" id="tf-15m">15m</button>
+    <button onclick="switchTF('1H')" class="tf-btn" id="tf-1H">1H</button>
+    <button onclick="switchTF('4H')" class="tf-btn" id="tf-4H">4H</button>
+    <button onclick="switchTF('1D')" class="tf-btn" id="tf-1D">1D</button>
+    <button onclick="switchTF('1W')" class="tf-btn" id="tf-1W">1W</button>
+    <span id="speed" style="margin-left:12px">Speed: 5x</span>
     <span id="progress" style="margin-left:auto;color:#666"></span>
 </div>
 
@@ -204,9 +214,11 @@ button:hover {{ background:#333; }} button.active {{ background:#00d4aa; color:#
 <div id="info"></div>
 
 <script>
-const allCandles = {candles_json};
+const allTFData = {all_tf_json};
+let allCandles = {candles_json};
 const allTrades = {trades_json};
 const allEquity = {equity_json};
+let currentTF = '15m';
 
 // Main chart
 const chartEl = document.getElementById('chart-container');
@@ -506,6 +518,58 @@ function showAll() {{
     document.getElementById('progress').textContent = allCandles.length + '/' + allCandles.length + ' bars';
 }}
 
+function switchTF(tf) {{
+    currentTF = tf;
+
+    // Update button styles
+    document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tf-' + tf).classList.add('active');
+
+    // Load new TF data
+    allCandles = allTFData[tf];
+
+    // Remove old trade boxes
+    tradeBoxes.forEach(s => {{ try {{ chart.removeSeries(s); }} catch(e) {{}} }});
+    tradeBoxes = [];
+
+    // Set candle data
+    candleSeries.setData(allCandles.map(c => ({{ time:c.time, open:c.open, high:c.high, low:c.low, close:c.close }})));
+    volumeSeries.setData(allCandles.map(c => ({{ time:c.time, value:c.volume, color: c.close>=c.open ? 'rgba(0,212,170,0.2)' : 'rgba(255,71,87,0.2)' }})));
+
+    // Draw trade markers + boxes on new TF
+    allMarkers = [];
+    allTrades.forEach(t => {{
+        allMarkers.push({{
+            time: t.entry_ct,
+            position: t.side === 'long' ? 'belowBar' : 'aboveBar',
+            color: t.pnl > 0 ? '#00d4aa' : '#ff4757',
+            shape: t.side === 'long' ? 'arrowUp' : 'arrowDown',
+            text: (t.side==='long'?'▲ LONG':'▼ SHORT') + ' $' + t.pnl.toFixed(2),
+        }});
+        allMarkers.push({{
+            time: t.exit_ct,
+            position: 'inBar',
+            color: t.pnl > 0 ? '#00d4aa' : '#ff4757',
+            shape: 'circle',
+            text: '✕ ' + t.reason + ' $' + t.pnl.toFixed(2),
+        }});
+        drawTradeBox(t);
+    }});
+    allMarkers.sort((a,b) => a.time - b.time);
+    candleSeries.setMarkers(allMarkers);
+
+    chart.timeScale().fitContent();
+    currentIdx = allCandles.length;
+
+    // Replay only works on 15m
+    if (tf !== '15m') {{
+        playing = false;
+        clearInterval(timer);
+        document.getElementById('playBtn').textContent = '▶ Play';
+        document.getElementById('progress').textContent = tf + ' — ' + allCandles.length + ' bars (replay on 15m only)';
+    }}
+}}
+
 // Resize
 window.addEventListener('resize', () => {{
     chart.resize(chartEl.clientWidth, chartEl.clientHeight);
@@ -541,50 +605,53 @@ def main():
     pnl = sum(t["pnl"] for t in trades)
     print(f"{len(trades)}T {wins}W ${pnl:,.2f}")
 
-    # Prepare candle data as JSON-safe list with unix timestamps
-    d15_clean = d15.tail(3000).copy()
-    d15_clean.index = d15_clean.index.tz_localize(None)
+    # Prepare ALL timeframe candle data
+    def df_to_candles(df, tail_n=3000):
+        d = df.tail(tail_n).copy()
+        d.index = d.index.tz_localize(None) if d.index.tz else d.index
+        out = []
+        for ts, row in d.iterrows():
+            out.append({
+                "time": int(ts.timestamp()),
+                "open": round(float(row["open"]), 6),
+                "high": round(float(row["high"]), 6),
+                "low": round(float(row["low"]), 6),
+                "close": round(float(row["close"]), 6),
+                "volume": round(float(row.get("volume", 0)), 2),
+            })
+        return out
 
-    candles = []
-    for ts, row in d15_clean.iterrows():
-        candles.append({
-            "time": int(ts.timestamp()),
-            "open": round(float(row["open"]), 6),
-            "high": round(float(row["high"]), 6),
-            "low": round(float(row["low"]), 6),
-            "close": round(float(row["close"]), 6),
-            "volume": round(float(row["volume"]), 2),
-        })
+    all_tf_candles = {
+        "15m": df_to_candles(tf["15m"], 3000),
+        "1H": df_to_candles(tf["1h"], 1000),
+        "4H": df_to_candles(tf["4h"], 500),
+        "1D": df_to_candles(tf["daily"], 250),
+        "1W": df_to_candles(tf["weekly"], 100),
+    }
 
-    # Build a set of candle timestamps for snapping
+    candles = all_tf_candles["15m"]  # default for replay
     candle_times = [c["time"] for c in candles]
 
     def snap_to_candle(ts_str):
-        """Find the nearest candle timestamp to a trade timestamp."""
         t = pd.Timestamp(ts_str)
-        if t.tzinfo:
-            t = t.tz_localize(None)
+        if t.tzinfo: t = t.tz_localize(None)
         ts_unix = int(t.timestamp())
-        # Find closest candle time
         best = candle_times[0]
         for ct in candle_times:
-            if abs(ct - ts_unix) < abs(best - ts_unix):
-                best = ct
+            if abs(ct - ts_unix) < abs(best - ts_unix): best = ct
         return best
 
-    # Snap trade timestamps to candle timestamps
     for t in trades:
         t["entry_ct"] = snap_to_candle(t["entry_time"])
         t["exit_ct"] = snap_to_candle(t["exit_time"])
 
-    # Equity with matching timestamps
     eq_json = []
     for e in eq_data:
         t = e["ts"]
         if t.tzinfo: t = t.tz_localize(None)
         eq_json.append({"time": int(t.timestamp()), "eq": e["eq"]})
 
-    html = generate_html(sym, candles, trades, eq_json)
+    html = generate_html(sym, all_tf_candles, trades, eq_json)
     fname = f"replay_{sym.lower()}.html"
     with open(fname, "w") as f:
         f.write(html)
