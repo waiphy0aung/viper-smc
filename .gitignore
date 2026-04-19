@@ -4,3 +4,4 @@ __pycache__/
 *.log
 *.csv
 *.service
+backtest_report.html
