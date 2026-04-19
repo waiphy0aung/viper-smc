@@ -184,48 +184,51 @@ def show_chart(symbol: str):
     total_pnl = sum(t["pnl"] for t in trades)
     print(f"{len(trades)}T {wins}W ${total_pnl:,.2f}")
 
-    # Prepare OHLCV data
-    d15 = tf["15m"].copy()
-    d15.index = d15.index.tz_localize(None)  # lightweight-charts needs naive timestamps
-    d15 = d15.reset_index()
-    d15.columns = ["time", "open", "high", "low", "close", "volume"]
+    # Prepare OHLCV — use last 2000 bars, clean timestamps
+    d15 = tf["15m"].tail(2000).copy()
+    d15.index = d15.index.tz_localize(None)
+    ohlcv = pd.DataFrame({
+        "time": d15.index,
+        "open": d15["open"].values,
+        "high": d15["high"].values,
+        "low": d15["low"].values,
+        "close": d15["close"].values,
+        "volume": d15["volume"].values,
+    })
 
     # Create chart
     chart = Chart(
         width=1400,
         height=800,
-        title=f"VIPER SMC — {symbol} Backtest",
         inner_width=1.0,
         inner_height=0.7,
     )
     chart.watermark(f"{symbol} • {len(trades)}T • {wins}W • ${total_pnl:,.2f}")
-    chart.set(d15)
-
-    # Volume
+    chart.set(ohlcv)
     chart.volume_config(up_color="rgba(0, 212, 170, 0.3)", down_color="rgba(255, 71, 87, 0.3)")
 
     # Trade markers
     for t in trades:
-        entry_t = t["entry_time"].tz_localize(None) if t["entry_time"].tzinfo else t["entry_time"]
-        exit_t = t["exit_time"].tz_localize(None) if t["exit_time"].tzinfo else t["exit_time"]
+        entry_t = pd.Timestamp(t["entry_time"]).tz_localize(None) if t["entry_time"].tzinfo else pd.Timestamp(t["entry_time"])
 
-        if t["pnl"] > 0:
-            color = "#00d4aa"
-            shape = "arrow_up" if t["side"] == "long" else "arrow_down"
-        else:
-            color = "#ff4757"
-            shape = "arrow_up" if t["side"] == "long" else "arrow_down"
+        color = "#00d4aa" if t["pnl"] > 0 else "#ff4757"
+        shape = "arrow_up" if t["side"] == "long" else "arrow_down"
+        pos_str = "below" if t["side"] == "long" else "above"
+        text = f"${t['pnl']:.2f} ({t['reason']})"
 
-        text = f"{'▲' if t['side'] == 'long' else '▼'} ${t['pnl']:.2f} ({t['reason']})"
+        try:
+            chart.marker(time=entry_t, position=pos_str, shape=shape, color=color, text=text)
+        except Exception:
+            pass
 
-        chart.marker(time=entry_t, position="below" if t["side"] == "long" else "above",
-                     shape=shape, color=color, text=text)
-
-    # Horizontal lines for SL/TP of last trade (if any)
+    # SL/TP lines for the most recent trade
     if trades:
         last = trades[-1]
-        chart.horizontal_line(last["sl"], color="red", width=1, style="dashed", text="SL")
-        chart.horizontal_line(last["tp"], color="lime", width=1, style="dashed", text="TP")
+        try:
+            chart.horizontal_line(last["sl"], color="#ff4757", width=1, style="dashed", text="SL")
+            chart.horizontal_line(last["tp"], color="#00d4aa", width=1, style="dashed", text="TP")
+        except Exception:
+            pass
 
     # Equity subchart
     eq_chart = chart.create_subchart(width=1.0, height=0.3, position="bottom")
