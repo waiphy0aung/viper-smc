@@ -250,7 +250,91 @@ let playing = false;
 let speed = 5;
 let timer = null;
 let currentTradeIdx = -1;
-let allMarkers = [];  // accumulates markers during replay
+let allMarkers = [];
+let tradeBoxes = [];  // track box series for cleanup
+
+function drawTradeBox(tr) {{
+    // TP zone: entry → TP (green box)
+    const tpSeries = chart.addLineSeries({{
+        color: 'rgba(0, 0, 0, 0)',
+        lineWidth: 0,
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+
+    // SL zone: entry → SL (red box)
+    const slSeries = chart.addLineSeries({{
+        color: 'rgba(0, 0, 0, 0)',
+        lineWidth: 0,
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+
+    // Entry line
+    const entryLine = chart.addLineSeries({{
+        color: '#ffffff',
+        lineWidth: 1,
+        lineStyle: 2,  // dashed
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+
+    // TP line
+    const tpLine = chart.addLineSeries({{
+        color: tr.side === 'long' ? 'rgba(0, 212, 170, 0.8)' : 'rgba(255, 71, 87, 0.8)',
+        lineWidth: 1,
+        lineStyle: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+
+    // SL line
+    const slLine = chart.addLineSeries({{
+        color: tr.side === 'long' ? 'rgba(255, 71, 87, 0.8)' : 'rgba(0, 212, 170, 0.8)',
+        lineWidth: 1,
+        lineStyle: 2,
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+
+    const t1 = tr.entry_ct;
+    const t2 = tr.exit_ct;
+
+    entryLine.setData([{{ time: t1, value: tr.entry_price }}, {{ time: t2, value: tr.entry_price }}]);
+    tpLine.setData([{{ time: t1, value: tr.tp }}, {{ time: t2, value: tr.tp }}]);
+    slLine.setData([{{ time: t1, value: tr.sl }}, {{ time: t2, value: tr.sl }}]);
+
+    // TP fill area (green for longs, at the TP side)
+    const tpFill = chart.addAreaSeries({{
+        topColor: tr.side === 'long' ? 'rgba(0, 150, 120, 0.25)' : 'rgba(180, 40, 50, 0.25)',
+        bottomColor: tr.side === 'long' ? 'rgba(0, 150, 120, 0.10)' : 'rgba(180, 40, 50, 0.10)',
+        lineColor: 'rgba(0,0,0,0)',
+        lineWidth: 0,
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+    // SL fill area (red for longs, at the SL side)
+    const slFill = chart.addAreaSeries({{
+        topColor: tr.side === 'long' ? 'rgba(180, 40, 50, 0.10)' : 'rgba(0, 150, 120, 0.10)',
+        bottomColor: tr.side === 'long' ? 'rgba(180, 40, 50, 0.25)' : 'rgba(0, 150, 120, 0.25)',
+        lineColor: 'rgba(0,0,0,0)',
+        lineWidth: 0,
+        lastValueVisible: false,
+        priceLineVisible: false,
+    }});
+
+    if (tr.side === 'long') {{
+        // Long: TP above entry (green), SL below entry (red)
+        tpFill.setData([{{ time: t1, value: tr.tp }}, {{ time: t2, value: tr.tp }}]);
+        slFill.setData([{{ time: t1, value: tr.entry_price }}, {{ time: t2, value: tr.entry_price }}]);
+    }} else {{
+        // Short: TP below entry (green), SL above entry (red)
+        tpFill.setData([{{ time: t1, value: tr.entry_price }}, {{ time: t2, value: tr.entry_price }}]);
+        slFill.setData([{{ time: t1, value: tr.sl }}, {{ time: t2, value: tr.sl }}]);
+    }}
+
+    tradeBoxes.push(tpSeries, slSeries, entryLine, tpLine, slLine, tpFill, slFill);
+}}
 
 function addBar(idx) {{
     if (idx >= allCandles.length) return;
@@ -274,6 +358,8 @@ function addBar(idx) {{
                 shape: tr.side === 'long' ? 'arrowUp' : 'arrowDown',
                 text: (tr.side === 'long' ? '▲ LONG' : '▼ SHORT') + ' $' + tr.pnl.toFixed(2),
             }});
+            // Draw TP/SL boxes
+            drawTradeBox(tr);
             showTradeInfo(tr, 'ENTRY');
         }}
         if (tr.exit_ct === t) {{
@@ -288,7 +374,6 @@ function addBar(idx) {{
         }}
     }});
 
-    // Sort markers by time (required by lightweight-charts)
     allMarkers.sort((a, b) => a.time - b.time);
     candleSeries.setMarkers(allMarkers);
 
@@ -386,12 +471,16 @@ function showAll() {{
     document.getElementById('playBtn').textContent = '▶ Play';
     clearInterval(timer);
 
+    // Remove old trade boxes
+    tradeBoxes.forEach(s => {{ try {{ chart.removeSeries(s); }} catch(e) {{}} }});
+    tradeBoxes = [];
+
     candleSeries.setData(allCandles.map(c => ({{ time:c.time, open:c.open, high:c.high, low:c.low, close:c.close }})));
     volumeSeries.setData(allCandles.map(c => ({{ time:c.time, value:c.volume, color: c.close>=c.open ? 'rgba(0,212,170,0.2)' : 'rgba(255,71,87,0.2)' }})));
     eqLine.setData(allEquity.map(e => ({{ time: e.time, value: e.eq }})));
     currentIdx = allCandles.length;
 
-    // All trade markers using pre-snapped candle times
+    // All trade markers + boxes
     allMarkers = [];
     allTrades.forEach(t => {{
         allMarkers.push({{
@@ -408,6 +497,7 @@ function showAll() {{
             shape: 'circle',
             text: '✕ ' + t.reason + ' $' + t.pnl.toFixed(2),
         }});
+        drawTradeBox(t);
     }});
     allMarkers.sort((a,b) => a.time - b.time);
     candleSeries.setMarkers(allMarkers);
